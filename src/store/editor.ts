@@ -1,24 +1,32 @@
 import { defineStore } from 'pinia'
-import type { Cue, EditorDocument, Locale, Snapshot } from '../types'
-import { loadDocument, saveDocument } from '../utils/db'
+import type {
+  Cue, DubbingExportFile, EditorDocument, Locale, MergeIssue, MergePlan, ScriptKind, Snapshot,
+} from '../types'
+import { loadDocument, saveDocument, saveDocumentsAtomically } from '../utils/db'
 import { makeId } from '../utils/id'
 import { parseScript, parseSrt, toSrt } from '../utils/subtitle'
+import {
+  DUBBING_DOCUMENT_ID, LEGACY_DOCUMENT_ID, SUBTITLE_DOCUMENT_ID,
+  applyMergePlan, deriveDubbingDocument, parseDubbingFile, reconcileDubbingLines, toDubbingExportFile,
+} from '../utils/dubbing'
 import { translate, type MessageKey } from '../i18n'
 
-const DOCUMENT_ID = 'subtitle-dubbing-document'
-let saveTimer: ReturnType<typeof setTimeout> | undefined
+const DOCUMENT_IDS: Record<ScriptKind, string> = { subtitle: SUBTITLE_DOCUMENT_ID, dubbing: DUBBING_DOCUMENT_ID }
+const SCRIPT_KINDS: ScriptKind[] = ['subtitle', 'dubbing']
+const saveTimers: Partial<Record<ScriptKind, ReturnType<typeof setTimeout>>> = {}
 let channel: BroadcastChannel | undefined
 
 const cloneCues = (cues: Cue[]): Cue[] => JSON.parse(JSON.stringify(cues)) as Cue[]
 const plainDocument = (document: EditorDocument): EditorDocument => JSON.parse(JSON.stringify(document)) as EditorDocument
 
-const createDefaultDocument = (): EditorDocument => ({
-  id: DOCUMENT_ID,
+const createDefaultSubtitleDocument = (): EditorDocument => ({
+  id: SUBTITLE_DOCUMENT_ID,
   title: '纪录片《开源之路》中文配音',
   language: 'zh-CN',
   revision: 0,
   updatedAt: Date.now(),
   lastWriter: '',
+  dubbingBase: null,
   actors: [
     { id: 'actor-narrator', name: '旁白 / Narrator', color: '#2f6fed', localeHint: 'zh-CN' },
     { id: 'actor-lin', name: '林博士 / Dr. Lin', color: '#cf5a39', localeHint: 'zh-CN' },
@@ -45,72 +53,124 @@ const createDefaultDocument = (): EditorDocument => ({
 type SaveState = 'saved' | 'dirty' | 'saving' | 'conflict'
 
 export const useEditorStore = defineStore('subtitle-editor', {
-  state: () => ({
-    document: createDefaultDocument(),
-    selectedCueId: 'cue-demo-03' as string | null,
-    actorFilter: 'all',
-    timelineZoom: 1,
-    saveState: 'saved' as SaveState,
-    saving: false,
-    initialized: false,
-    conflict: false,
-    online: navigator.onLine,
-    tabId: makeId('tab'),
-    lastSeenRevision: 0,
-    mutationSerial: 0,
-    past: [] as { label: string; cues: Cue[]; selectedCueId: string | null }[],
-    future: [] as { label: string; cues: Cue[]; selectedCueId: string | null }[],
-  }),
+  state: () => {
+    const subtitle = createDefaultSubtitleDocument()
+    return {
+      documents: {
+        subtitle,
+        dubbing: deriveDubbingDocument(subtitle, null),
+      } as Record<ScriptKind, EditorDocument>,
+      activeScript: 'subtitle' as ScriptKind,
+      selectedCueId: 'cue-demo-03' as string | null,
+      actorFilter: 'all',
+      timelineZoom: 1,
+      saveStates: { subtitle: 'saved', dubbing: 'saved' } as Record<ScriptKind, SaveState>,
+      saving: false,
+      initialized: false,
+      conflicts: { subtitle: false, dubbing: false } as Record<ScriptKind, boolean>,
+      online: navigator.onLine,
+      tabId: makeId('tab'),
+      lastSeenRevisions: { subtitle: 0, dubbing: 0 } as Record<ScriptKind, number>,
+      mutationSerials: { subtitle: 0, dubbing: 0 } as Record<ScriptKind, number>,
+      past: [] as { label: string; cues: Cue[]; selectedCueId: string | null }[],
+      future: [] as { label: string; cues: Cue[]; selectedCueId: string | null }[],
+      // 配音稿对账合并：回传文件在对账成功前一直保留，失败可重试
+      pendingMergeFile: null as DubbingExportFile | null,
+      pendingMergeSource: 'file' as 'file' | 'local',
+      mergePlan: null as MergePlan | null,
+      mergeIssues: [] as MergeIssue[],
+      mergeBusy: false,
+    }
+  },
   getters: {
-    t: (state) => (key: MessageKey, values?: Record<string, string | number>) => translate(state.document.language, key, values),
+    /** 当前正在编辑的稿件（字幕稿或配音稿） */
+    document: (state) => state.documents[state.activeScript],
+    saveState: (state) => state.saveStates[state.activeScript],
+    conflict: (state) => state.conflicts[state.activeScript],
+    anyConflict: (state) => state.conflicts.subtitle || state.conflicts.dubbing,
+    t: (state) => (key: MessageKey, values?: Record<string, string | number>) => translate(state.documents[state.activeScript].language, key, values),
     selectedCue(state): Cue | undefined {
-      return state.document.cues.find((cue) => cue.id === state.selectedCueId)
+      return state.documents[state.activeScript].cues.find((cue) => cue.id === state.selectedCueId)
     },
     visibleCues(state): Cue[] {
+      const cues = state.documents[state.activeScript].cues
       return state.actorFilter === 'all'
-        ? state.document.cues
-        : state.document.cues.filter((cue) => cue.actorId === state.actorFilter)
+        ? cues
+        : cues.filter((cue) => cue.actorId === state.actorFilter)
     },
     totalDuration(state): number {
-      return Math.max(10, ...state.document.cues.map((cue) => cue.end)) * 1.04
+      return Math.max(10, ...state.documents[state.activeScript].cues.map((cue) => cue.end)) * 1.04
+    },
+    /** 配音稿相对其基线被配音组改动、尚未合并回字幕稿的台词数 */
+    dubbingDirtyLines(state): number {
+      const dubbing = state.documents.dubbing
+      const base = dubbing.dubbingBase?.lines ?? {}
+      return dubbing.cues.filter((cue) => {
+        const line = base[cue.id]
+        return !line || line.target !== cue.target || line.speed !== cue.speed
+      }).length
     },
   },
   actions: {
     async initialize() {
       if (this.initialized) return
       this.online = navigator.onLine
-      const stored = await loadDocument(DOCUMENT_ID)
-      if (stored) {
-        this.document = stored
-        this.lastSeenRevision = stored.revision
-      } else {
-        const saved = await saveDocument(plainDocument(this.document))
-        this.document = saved
-        this.lastSeenRevision = saved.revision
+      let subtitle = await loadDocument(SUBTITLE_DOCUMENT_ID)
+      if (!subtitle) {
+        // 迁移早期“字幕+配音混存”的单文档：作为字幕稿留档，配音稿由此派生
+        const legacy = await loadDocument(LEGACY_DOCUMENT_ID)
+        if (legacy) subtitle = { ...legacy, id: SUBTITLE_DOCUMENT_ID, dubbingBase: null }
       }
+      if (subtitle) {
+        this.documents.subtitle = subtitle
+        this.lastSeenRevisions.subtitle = subtitle.revision
+      } else {
+        const saved = await saveDocument(plainDocument(this.documents.subtitle))
+        this.documents.subtitle = saved
+        this.lastSeenRevisions.subtitle = saved.revision
+      }
+      const dubbing = await loadDocument(DUBBING_DOCUMENT_ID)
+      if (dubbing) {
+        this.documents.dubbing = dubbing
+        this.lastSeenRevisions.dubbing = dubbing.revision
+      } else {
+        const derived = deriveDubbingDocument(plainDocument(this.documents.subtitle), null)
+        const saved = await saveDocument(derived)
+        this.documents.dubbing = saved
+        this.lastSeenRevisions.dubbing = saved.revision
+      }
+      this.selectedCueId = this.document.cues[0]?.id ?? null
       this.initialized = true
       if ('BroadcastChannel' in window) {
         channel = new BroadcastChannel('sologsb-1001-document')
         channel.onmessage = async (event) => {
           const message = event.data as { type: string; tabId: string; revision: number; documentId: string }
-          if (message.type !== 'document-updated' || message.tabId === this.tabId || message.documentId !== DOCUMENT_ID) return
-          if (message.revision <= this.lastSeenRevision) return
-          if (this.saveState === 'dirty' || this.saveState === 'saving' || this.conflict) {
-            this.conflict = true
-            this.saveState = 'conflict'
+          if (message.type !== 'document-updated' || message.tabId === this.tabId) return
+          const kind = SCRIPT_KINDS.find((item) => DOCUMENT_IDS[item] === message.documentId)
+          if (!kind || message.revision <= this.lastSeenRevisions[kind]) return
+          if (this.saveStates[kind] === 'dirty' || this.saveStates[kind] === 'saving' || this.conflicts[kind]) {
+            this.conflicts[kind] = true
+            this.saveStates[kind] = 'conflict'
             return
           }
-          const latest = await loadDocument(DOCUMENT_ID)
-          if (latest && latest.revision > this.lastSeenRevision) {
-            this.document = latest
-            this.lastSeenRevision = latest.revision
-            this.saveState = 'saved'
+          const latest = await loadDocument(DOCUMENT_IDS[kind])
+          if (latest && latest.revision > this.lastSeenRevisions[kind]) {
+            this.documents[kind] = latest
+            this.lastSeenRevisions[kind] = latest.revision
+            this.saveStates[kind] = 'saved'
           }
         }
       }
     },
     setOnline(value: boolean) {
       this.online = value
+    },
+    setActiveScript(kind: ScriptKind) {
+      if (this.activeScript === kind) return
+      this.activeScript = kind
+      this.past = []
+      this.future = []
+      this.selectedCueId = this.documents[kind].cues[0]?.id ?? null
     },
     selectCue(id: string | null) {
       this.selectedCueId = id
@@ -131,69 +191,75 @@ export const useEditorStore = defineStore('subtitle-editor', {
       this.markChanged(label)
     },
     markChanged(label: string, persist = true) {
-      this.document.updatedAt = Date.now()
+      const kind = this.activeScript
+      this.documents[kind].updatedAt = Date.now()
       if (persist) {
-        this.saveState = 'dirty'
-        this.mutationSerial += 1
-        if (saveTimer) clearTimeout(saveTimer)
-        saveTimer = setTimeout(() => void this.persist(label), 500)
+        this.saveStates[kind] = 'dirty'
+        this.mutationSerials[kind] += 1
+        if (saveTimers[kind]) clearTimeout(saveTimers[kind])
+        saveTimers[kind] = setTimeout(() => void this.persist(kind, label), 500)
       }
     },
-    async persist(label = 'autosave') {
-      if (!this.initialized || this.conflict || this.saveState === 'saving') return
-      const serial = this.mutationSerial
-      this.saveState = 'saving'
+    async persist(kind: ScriptKind, label = 'autosave') {
+      if (!this.initialized || this.conflicts[kind] || this.saveStates[kind] === 'saving') return
+      const serial = this.mutationSerials[kind]
+      this.saveStates[kind] = 'saving'
       this.saving = true
       try {
-        const next = await saveDocument({ ...plainDocument(this.document), lastWriter: this.tabId }, this.lastSeenRevision)
-        this.document.revision = next.revision
-        this.document.updatedAt = next.updatedAt
-        this.lastSeenRevision = next.revision
-        if (serial === this.mutationSerial) {
-          this.saveState = 'saved'
-        } else {
-          this.saveState = 'dirty'
-        }
-        channel?.postMessage({ type: 'document-updated', tabId: this.tabId, revision: next.revision, documentId: DOCUMENT_ID })
+        const next = await saveDocument({ ...plainDocument(this.documents[kind]), lastWriter: this.tabId }, this.lastSeenRevisions[kind])
+        this.documents[kind].revision = next.revision
+        this.documents[kind].updatedAt = next.updatedAt
+        this.lastSeenRevisions[kind] = next.revision
+        this.saveStates[kind] = serial === this.mutationSerials[kind] ? 'saved' : 'dirty'
+        channel?.postMessage({ type: 'document-updated', tabId: this.tabId, revision: next.revision, documentId: DOCUMENT_IDS[kind] })
       } catch (error) {
         if (error instanceof Error && error.message === 'REVISION_CONFLICT') {
-          this.conflict = true
-          this.saveState = 'conflict'
+          this.conflicts[kind] = true
+          this.saveStates[kind] = 'conflict'
         } else {
-          this.saveState = 'dirty'
+          this.saveStates[kind] = 'dirty'
           console.error(label, error)
         }
       } finally {
         this.saving = false
-        if (this.saveState === 'dirty') {
-          if (saveTimer) clearTimeout(saveTimer)
-          saveTimer = setTimeout(() => void this.persist(label), 700)
+        if (this.saveStates[kind] === 'dirty') {
+          if (saveTimers[kind]) clearTimeout(saveTimers[kind])
+          saveTimers[kind] = setTimeout(() => void this.persist(kind, label), 700)
         }
       }
     },
+    conflictedKinds(): ScriptKind[] {
+      const kinds = SCRIPT_KINDS.filter((kind) => this.conflicts[kind])
+      return kinds.length ? kinds : [this.activeScript]
+    },
     async keepMine() {
+      this.saving = true
       try {
-        this.saving = true
-        const latest = await loadDocument(DOCUMENT_ID)
-        const expected = latest?.revision ?? this.lastSeenRevision
-        const next = await saveDocument({ ...plainDocument(this.document), lastWriter: this.tabId }, expected)
-        this.document.revision = next.revision
-        this.lastSeenRevision = next.revision
-        this.conflict = false
-        this.saveState = 'saved'
-        channel?.postMessage({ type: 'document-updated', tabId: this.tabId, revision: next.revision, documentId: DOCUMENT_ID })
+        for (const kind of this.conflictedKinds()) {
+          const latest = await loadDocument(DOCUMENT_IDS[kind])
+          const expected = latest?.revision ?? this.lastSeenRevisions[kind]
+          const next = await saveDocument({ ...plainDocument(this.documents[kind]), lastWriter: this.tabId }, expected)
+          this.documents[kind].revision = next.revision
+          this.documents[kind].updatedAt = next.updatedAt
+          this.lastSeenRevisions[kind] = next.revision
+          this.conflicts[kind] = false
+          this.saveStates[kind] = 'saved'
+          channel?.postMessage({ type: 'document-updated', tabId: this.tabId, revision: next.revision, documentId: DOCUMENT_IDS[kind] })
+        }
       } finally {
         this.saving = false
       }
     },
     async loadLatest() {
-      const latest = await loadDocument(DOCUMENT_ID)
-      if (!latest) return
-      this.document = latest
-      this.lastSeenRevision = latest.revision
-      this.conflict = false
-      this.saveState = 'saved'
-      this.selectedCueId = latest.cues[0]?.id ?? null
+      for (const kind of this.conflictedKinds()) {
+        const latest = await loadDocument(DOCUMENT_IDS[kind])
+        if (!latest) continue
+        this.documents[kind] = latest
+        this.lastSeenRevisions[kind] = latest.revision
+        this.conflicts[kind] = false
+        this.saveStates[kind] = 'saved'
+        if (kind === this.activeScript) this.selectedCueId = latest.cues[0]?.id ?? null
+      }
     },
     undo() {
       const entry = this.past.pop()
@@ -315,6 +381,145 @@ export const useEditorStore = defineStore('subtitle-editor', {
       anchor.download = `${this.document.title || 'subtitle'}.srt`
       anchor.click()
       URL.revokeObjectURL(url)
+    },
+    /**
+     * 导出配音稿：按当前字幕稿重新生成配音稿留档（开启新一轮对账基线），
+     * 并把自包含基线的配音稿文件交给配音组离线编辑。
+     */
+    async exportDubbing() {
+      const derived = deriveDubbingDocument(plainDocument(this.documents.subtitle), plainDocument(this.documents.dubbing))
+      try {
+        const saved = await saveDocument({ ...derived, lastWriter: this.tabId }, this.lastSeenRevisions.dubbing)
+        this.documents.dubbing = saved
+        this.lastSeenRevisions.dubbing = saved.revision
+        this.conflicts.dubbing = false
+        this.saveStates.dubbing = 'saved'
+        channel?.postMessage({ type: 'document-updated', tabId: this.tabId, revision: saved.revision, documentId: DUBBING_DOCUMENT_ID })
+      } catch (error) {
+        if (error instanceof Error && error.message === 'REVISION_CONFLICT') {
+          this.conflicts.dubbing = true
+          this.saveStates.dubbing = 'conflict'
+        } else {
+          console.error('export-dubbing', error)
+        }
+        return false
+      }
+      const file = toDubbingExportFile(this.documents.dubbing)
+      const blob = new Blob([JSON.stringify(file, null, 2)], { type: 'application/json;charset=utf-8' })
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = `${this.documents.subtitle.title || 'dubbing'}-配音稿.json`
+      anchor.click()
+      URL.revokeObjectURL(url)
+      return true
+    },
+    /** 导入配音组回传的文件并立即对账；失败时文件保留在 pendingMergeFile 中供重试 */
+    prepareMergeFromFile(text: string) {
+      const parsed = parseDubbingFile(text)
+      if (!parsed.ok) {
+        this.pendingMergeFile = null
+        this.mergePlan = null
+        this.mergeIssues = parsed.issues
+        return false
+      }
+      this.pendingMergeFile = parsed.file
+      this.pendingMergeSource = 'file'
+      return this.reconcilePending()
+    },
+    /** 直接用本机配音稿留档对账（配音组在同一工作台编辑的场景） */
+    prepareMergeFromLocal() {
+      this.pendingMergeFile = toDubbingExportFile(this.documents.dubbing)
+      this.pendingMergeSource = 'local'
+      return this.reconcilePending()
+    },
+    /** 对账（可重复调用）：只生成合并计划，不写任何数据 */
+    reconcilePending() {
+      if (!this.pendingMergeFile) return false
+      const result = reconcileDubbingLines(this.pendingMergeFile.lines, this.documents.subtitle)
+      if (!result.ok) {
+        this.mergePlan = null
+        this.mergeIssues = result.issues
+        return false
+      }
+      this.mergeIssues = []
+      this.mergePlan = result.plan
+      return true
+    },
+    clearMerge() {
+      this.pendingMergeFile = null
+      this.mergePlan = null
+      this.mergeIssues = []
+    },
+    /**
+     * 确认合并：字幕稿与配音稿在同一个 IndexedDB 事务中写入。
+     * 任一文档写入失败（含版本冲突）整体回滚，两份稿子都不会留下半成品；
+     * 回传文件保留在内存中，解决冲突后可直接重试。
+     * 返回写入的台词数，失败返回 false。
+     */
+    async confirmMerge(): Promise<number | false> {
+      const plan = this.mergePlan
+      if (!plan || !this.pendingMergeFile || this.mergeBusy) return false
+      this.mergeBusy = true
+      try {
+        const subtitle = plainDocument(this.documents.subtitle)
+        const nextSubtitle: EditorDocument = {
+          ...subtitle,
+          cues: applyMergePlan(subtitle.cues, plan),
+          revision: this.lastSeenRevisions.subtitle + 1,
+          lastWriter: this.tabId,
+        }
+        // 配音稿同步到合并后的状态，并以合并结果为新一轮基线
+        const nextDubbing = deriveDubbingDocument(nextSubtitle, plainDocument(this.documents.dubbing))
+        const [savedSubtitle, savedDubbing] = await saveDocumentsAtomically([
+          { document: nextSubtitle, expectedRevision: this.lastSeenRevisions.subtitle },
+          { document: nextDubbing, expectedRevision: this.lastSeenRevisions.dubbing },
+        ])
+        if (this.activeScript === 'subtitle') {
+          this.past.push({ label: 'merge-dubbing', cues: cloneCues(this.documents.subtitle.cues), selectedCueId: this.selectedCueId })
+          if (this.past.length > 60) this.past.shift()
+        } else {
+          this.past = []
+        }
+        this.future = []
+        if (saveTimers.subtitle) clearTimeout(saveTimers.subtitle)
+        if (saveTimers.dubbing) clearTimeout(saveTimers.dubbing)
+        this.documents.subtitle = savedSubtitle
+        this.documents.dubbing = savedDubbing
+        this.lastSeenRevisions.subtitle = savedSubtitle.revision
+        this.lastSeenRevisions.dubbing = savedDubbing.revision
+        this.saveStates.subtitle = 'saved'
+        this.saveStates.dubbing = 'saved'
+        channel?.postMessage({ type: 'document-updated', tabId: this.tabId, revision: savedSubtitle.revision, documentId: SUBTITLE_DOCUMENT_ID })
+        channel?.postMessage({ type: 'document-updated', tabId: this.tabId, revision: savedDubbing.revision, documentId: DUBBING_DOCUMENT_ID })
+        const applied = plan.appliedCount
+        this.clearMerge()
+        return applied
+      } catch (error) {
+        if (error instanceof Error && error.message === 'REVISION_CONFLICT') {
+          const [latestSubtitle, latestDubbing] = await Promise.all([
+            loadDocument(SUBTITLE_DOCUMENT_ID),
+            loadDocument(DUBBING_DOCUMENT_ID),
+          ])
+          if (latestSubtitle && latestSubtitle.revision !== this.lastSeenRevisions.subtitle) {
+            this.conflicts.subtitle = true
+            this.saveStates.subtitle = 'conflict'
+          }
+          if (latestDubbing && latestDubbing.revision !== this.lastSeenRevisions.dubbing) {
+            this.conflicts.dubbing = true
+            this.saveStates.dubbing = 'conflict'
+          }
+          this.mergeIssues = [{ key: 'mergeErrorRevision' }]
+        } else {
+          console.error('merge-dubbing', error)
+          this.mergeIssues = [{ key: 'saveError' }]
+        }
+        // 写入失败：计划作废（字幕稿可能已变），回传文件保留，可重新对账
+        this.mergePlan = null
+        return false
+      } finally {
+        this.mergeBusy = false
+      }
     },
   },
 })

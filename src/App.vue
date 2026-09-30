@@ -3,16 +3,18 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
-  Clock, Delete, DocumentCopy, Download, EditPen, Files, Lock, MagicStick, Monitor,
+  ArrowDown, Clock, Delete, DocumentCopy, Download, EditPen, Files, Lock, MagicStick, Microphone, Monitor,
   RefreshLeft, RefreshRight, Search, Unlock, UploadFilled,
 } from '@element-plus/icons-vue'
 import { useEditorStore } from './store/editor'
-import type { Cue, CueConflict } from './types'
+import type { Cue, CueConflict, MergeIssue, ScriptKind } from './types'
+import type { MessageKey } from './i18n'
 import { formatTime } from './utils/subtitle'
 
 const store = useEditorStore()
-const { document: project, selectedCue, selectedCueId, visibleCues, saveState, conflict, online, timelineZoom, actorFilter } = storeToRefs(store)
+const { document: project, selectedCue, selectedCueId, visibleCues, saveState, anyConflict, online, timelineZoom, actorFilter, activeScript } = storeToRefs(store)
 const fileInput = ref<HTMLInputElement>()
+const mergeFileInput = ref<HTMLInputElement>()
 const snapshotDialog = ref(false)
 const snapshotName = ref('')
 const search = ref('')
@@ -32,6 +34,20 @@ const actorColor = (id: string) => project.value.actors.find((actor) => actor.id
 const actorName = (id: string) => project.value.actors.find((actor) => actor.id === id)?.name ?? '—'
 const statusLabel = (status: Cue['status']) => store.t(status)
 const statusType = (status: Cue['status']) => status === 'reviewed' ? 'success' : status === 'issue' ? 'danger' : 'info'
+const docStateBadge = (kind: ScriptKind) => store.saveStates[kind] === 'dirty' || store.saveStates[kind] === 'conflict'
+const issueText = (issue: MergeIssue) => store.t(issue.key as MessageKey, issue.values)
+const mergeRows = computed(() => {
+  const plan = store.mergePlan
+  if (!plan) return []
+  const cues = store.documents.subtitle.cues
+  return plan.results
+    .filter((item) => item.kind !== 'unchanged')
+    .map((item) => {
+      const index = cues.findIndex((cue) => cue.id === item.cueId)
+      const cue = cues[index]
+      return { ...item, index: index + 1, start: cue?.start ?? 0, end: cue?.end ?? 0 }
+    })
+})
 
 function updateSelected(patch: Partial<Cue>, label = 'update-cue') {
   if (selectedCue.value) store.updateCue(selectedCue.value.id, patch, label)
@@ -78,6 +94,46 @@ async function importFile(event: Event) {
   } finally {
     input.value = ''
   }
+}
+async function onDubbingCommand(command: string) {
+  if (command === 'export') {
+    const run = async () => {
+      const ok = await store.exportDubbing()
+      if (ok) ElMessage.success(store.t('dubbingExported'))
+      else ElMessage.error(store.t('saveError'))
+    }
+    if (store.dubbingDirtyLines > 0) {
+      ElMessageBox.confirm(store.t('confirmExportDubbing', { count: store.dubbingDirtyLines }), { type: 'warning', confirmButtonText: store.t('exportDubbing'), cancelButtonText: store.t('cancel') })
+        .then(run)
+        .catch(() => undefined)
+    } else {
+      await run()
+    }
+    return
+  }
+  if (command === 'merge-file') {
+    mergeFileInput.value?.click()
+    return
+  }
+  if (command === 'merge-local') store.prepareMergeFromLocal()
+}
+async function importMergeFile(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  try {
+    store.prepareMergeFromFile(await file.text())
+  } finally {
+    input.value = ''
+  }
+}
+async function confirmMerge() {
+  const applied = await store.confirmMerge()
+  if (applied === false) {
+    ElMessage.error(store.t('mergeFailedTitle'))
+    return
+  }
+  ElMessage.success(applied > 0 ? store.t('mergeDone', { count: applied }) : store.t('mergeNothing'))
 }
 function requestDelete(id: string) {
   ElMessageBox.confirm(store.t('confirmDelete'), { type: 'warning', confirmButtonText: store.t('delete') })
@@ -142,17 +198,38 @@ const handleOffline = () => setOnline(false)
           <el-option label="English" value="en-US" />
           <el-option label="日本語" value="ja-JP" />
         </el-select>
+        <el-radio-group :model-value="activeScript" size="small" class="script-switch" @change="store.setActiveScript($event as ScriptKind)">
+          <el-radio-button value="subtitle">{{ store.t('subtitleScript') }}<i v-if="docStateBadge('subtitle')" class="doc-dot" /></el-radio-button>
+          <el-radio-button value="dubbing">{{ store.t('dubbingScript') }}<i v-if="docStateBadge('dubbing')" class="doc-dot" /></el-radio-button>
+        </el-radio-group>
         <span class="save-state" :class="saveState"><i />{{ saveLabel }}</span>
         <input ref="fileInput" class="file-input" type="file" accept=".srt,.txt,text/plain" @change="importFile" />
+        <input ref="mergeFileInput" class="file-input" type="file" accept=".json,application/json" @change="importMergeFile" />
         <el-button :icon="UploadFilled" @click="fileInput?.click()">{{ store.t('import') }}</el-button>
         <el-button :icon="Download" @click="store.exportSrt">{{ store.t('export') }}</el-button>
+        <el-dropdown trigger="click" @command="onDubbingCommand">
+          <el-button :icon="Microphone">{{ store.t('dubbingScript') }}<el-icon class="el-icon--right"><ArrowDown /></el-icon></el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item command="export">{{ store.t('exportDubbing') }}</el-dropdown-item>
+              <el-dropdown-item command="merge-file">{{ store.t('mergeFromFile') }}</el-dropdown-item>
+              <el-dropdown-item command="merge-local">{{ store.t('mergeFromLocal') }}</el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
         <el-button type="primary" :icon="DocumentCopy" @click="snapshotDialog = true">{{ store.t('snapshot') }}</el-button>
       </div>
     </header>
 
     <div v-if="!online" class="network-banner offline">{{ store.t('offline') }}</div>
 
-    <div v-if="conflict" class="conflict-banner">
+    <div v-if="activeScript === 'dubbing'" class="dubbing-banner">
+      <span>{{ store.t('dubbingModeBanner') }}</span>
+      <span v-if="store.documents.dubbing.dubbingBase" class="dubbing-base">{{ store.t('dubbingBaseInfo', { revision: store.documents.dubbing.dubbingBase.revision }) }}</span>
+      <span v-if="store.dubbingDirtyLines" class="dubbing-dirty">{{ store.t('dubbingDirtyHint', { count: store.dubbingDirtyLines }) }}</span>
+    </div>
+
+    <div v-if="anyConflict" class="conflict-banner">
       <div>
         <strong>{{ store.t('conflictTitle') }}</strong>
         <span>{{ store.t('conflictBody') }}</span>
@@ -328,6 +405,55 @@ const handleOffline = () => setOnline(false)
         <p v-if="!project.snapshots.length" class="empty-state">{{ store.t('noSnapshots') }}</p>
       </div>
       <template #footer><el-button type="primary" @click="createSnapshot">{{ store.t('snapshot') }}</el-button></template>
+    </el-dialog>
+
+    <el-dialog :model-value="!!store.mergePlan" :title="store.t('mergeReportTitle')" width="760px" @close="store.clearMerge()">
+      <template v-if="store.mergePlan">
+        <div class="merge-summary">
+          <el-tag type="success">{{ store.t('mergeApplied', { count: store.mergePlan.appliedCount }) }}</el-tag>
+          <el-tag type="info">{{ store.t('mergePreserved', { count: store.mergePlan.preservedCount }) }}</el-tag>
+          <el-tag type="info">{{ store.t('mergeUnchanged', { count: store.mergePlan.unchangedCount }) }}</el-tag>
+          <span class="merge-source">{{ store.t('mergeSource') }}：{{ store.t(store.pendingMergeSource === 'file' ? 'mergeSourceFile' : 'mergeSourceLocal') }}</span>
+        </div>
+        <p v-if="store.mergePlan.conflictCount" class="merge-conflict-note">{{ store.t('mergeConflictNote', { count: store.mergePlan.conflictCount }) }}</p>
+        <el-table :data="mergeRows" max-height="340" size="small" class="merge-table">
+          <el-table-column type="index" label="#" width="52" />
+          <el-table-column :label="store.t('timecode')" width="180">
+            <template #default="{ row }"><code>{{ formatTime(row.start) }} → {{ formatTime(row.end) }}</code></template>
+          </el-table-column>
+          <el-table-column :label="store.t('colResult')" width="140">
+            <template #default="{ row }">
+              <el-tag v-if="row.kind === 'applied'" size="small" :type="row.conflict ? 'warning' : 'success'">{{ store.t('kindApplied') }}</el-tag>
+              <el-tag v-else size="small" type="info">{{ store.t(row.reason === 'locked' ? 'kindPreservedLocked' : 'kindPreservedReviewed') }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column :label="store.t('colChange')" min-width="300">
+            <template #default="{ row }">
+              <div class="merge-diff" :class="{ preserved: row.kind === 'preserved' }">
+                <p><span>{{ store.t('subtitleScript') }}</span>{{ row.from?.target }}</p>
+                <p><span>{{ store.t('dubbingScript') }}</span>{{ row.to?.target }}<em v-if="row.from && row.to && row.from.speed !== row.to.speed">{{ store.t('speed') }} {{ row.from.speed }} → {{ row.to.speed }}</em></p>
+              </div>
+            </template>
+          </el-table-column>
+        </el-table>
+      </template>
+      <template #footer>
+        <el-button @click="store.clearMerge()">{{ store.t('cancel') }}</el-button>
+        <el-button type="primary" :disabled="!store.mergePlan?.appliedCount" :loading="store.mergeBusy" @click="confirmMerge">{{ store.t('confirmMerge') }}</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog :model-value="!!store.mergeIssues.length" :title="store.t('mergeFailedTitle')" width="560px" @close="store.clearMerge()">
+      <el-alert type="error" :closable="false" class="merge-issues">
+        <ul>
+          <li v-for="(issue, index) in store.mergeIssues" :key="index">{{ issueText(issue) }}</li>
+        </ul>
+      </el-alert>
+      <p class="merge-retry-hint">{{ store.t('mergeRetryHint') }}</p>
+      <template #footer>
+        <el-button @click="store.clearMerge()">{{ store.t('discardMerge') }}</el-button>
+        <el-button v-if="store.pendingMergeFile" type="primary" @click="store.reconcilePending()">{{ store.t('retryMerge') }}</el-button>
+      </template>
     </el-dialog>
   </div>
 </template>
