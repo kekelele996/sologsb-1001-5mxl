@@ -133,3 +133,42 @@ kbd { padding: 2px 5px; border: 1px solid #5a6981; border-radius: 4px; color: wh
   .cue-row { grid-template-columns: 34px minmax(0, 1fr); }
   .cue-quick-actions { grid-column: 2; }
 }
+
+/* —— 模式切换与配音稿工作台 —— */
+.workbench { display: flex; flex-direction: column; }
+.workbench .workspace { flex: 1; }
+.dubbing-workspace { grid-template-columns: 258px minmax(0, 1fr); }
+.dubbing-note { display: flex; align-items: flex-start; gap: 8px; margin: 2px 0 12px; padding: 10px 12px; border: 1px solid #d6e2f5; border-radius: 9px; color: #3a5a8c; background: #f0f6ff; font-size: 12px; line-height: 1.55; }
+.dubbing-note .el-icon { margin-top: 2px; color: #2f6fed; }
+.dubbing-row.orphan { background: #fff7f7; border-color: #f3c6c6; }
+.dubbing-text-input { margin: 4px 0; }
+.dubbing-meta { display: flex; align-items: center; gap: 8px; margin-top: 6px; color: #7b879a; font-size: 11px; }
+.dubbing-meta label { margin: 0; }
+.dubbing-actor-select { width: 160px; }
+.dubbing-meta .el-input-number { width: 110px; }
+
+/* —— 配音对账合并对话框 —— */
+.merge-summary { display: flex; flex-wrap: wrap; gap: 14px; margin-bottom: 12px; color: #5a6a82; font-size: 12px; }
+.merge-summary .ok { color: #2f9e6e; font-weight: 700; }
+.merge-summary .skip { color: #8a96a8; }
+.merge-summary .fail { color: #e25f59; font-weight: 700; }
+.merge-fail-banner { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; padding: 10px 12px; border: 1px solid #f3c6c6; border-radius: 9px; color: #8a3a34; background: #fff5f5; font-size: 12px; }
+.merge-fail-banner .el-icon { color: #e25f59; }
+.merge-fail-banner div { flex: 1; display: flex; flex-direction: column; gap: 2px; }
+.merge-lines { display: flex; flex-direction: column; gap: 8px; max-height: 420px; overflow: auto; }
+.merge-line { display: flex; gap: 10px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--paper); }
+.merge-line.changed { border-left: 3px solid #2f9e6e; }
+.merge-line.unchanged { opacity: .78; }
+.merge-line.missing, .merge-line.drifted { border-left: 3px solid #e25f59; background: #fffafa; }
+.merge-line-status { padding-top: 2px; }
+.merge-line-status .ok { color: #2f9e6e; }
+.merge-line-status .skip { color: #b0bac8; }
+.merge-line-status .fail { color: #e25f59; }
+.merge-line-body { flex: 1; min-width: 0; }
+.merge-line-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.merge-line-head code { color: #66748a; font-size: 11px; }
+.merge-line-detail { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 5px 0; color: #8a96a8; font-size: 11px; }
+.merge-line-detail .drift { color: #b36b00; font-weight: 700; }
+.merge-line-detail .reason.fail { color: #c0504a; }
+.changed-fields { display: flex; gap: 4px; }
+.merge-line-text { margin: 4px 0 0; color: #3a475c; font-size: 12px; line-height: 1.5; }
